@@ -1,0 +1,4 @@
+2026-04-27 14:20:16,226 [INFO] httpx: HTTP Request: GET http://localhost:6333/collections "HTTP/1.1 200 OK"
+2026-04-27 14:20:16,226 [INFO] doc_parser.ingestion.vector_store: Collection 'documentss' already exists — skipping creation
+2026-04-27 14:20:16,252 [INFO] httpx: HTTP Request: POST http://localhost:6333/collections/documentss/points/count "HTTP/1.1 200 OK"
+2026-04-27 14:20:16,418 [INFO] httpx: HTTP Request: GET http://localhost:6333 "HTTP/1.1 200 OK"

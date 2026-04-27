@@ -1,33 +1,73 @@
 pipeline:
   maas:
-    enabled: false          # Disable Z.AI cloud API
+    enabled: false
 
   ocr_api:
     api_host: localhost
     api_port: 11434
-    api_path: /api/generate   # Ollama's native endpoint (NOT the OpenAI-compat one)
-    model: glm-ocr:latest     # Must match what you pulled
-    api_mode: ollama_generate  # Essential — prevents 502 errors
+    api_path: /api/generate
+    model: glm-ocr:latest
+    api_mode: ollama_generate
+    connect_timeout: 30
+    request_timeout: 120
+    retry_max_attempts: 2
+    retry_backoff_base_seconds: 0.5
+    retry_backoff_max_seconds: 8.0
+    retry_jitter_ratio: 0.2
+    retry_status_codes: [429, 500, 502, 503, 504]
+    connection_pool_size: 128
 
-  enable_layout: true         # PP-DocLayout-V3 layout detection
-                              # Requires: uv pip install "glmocr[layout]"
-
-  # Bug fix: region_maxsize must be an int (0 = unlimited). SDK default of null
-  # causes Queue(maxsize=None) → TypeError in error handler.
+  # ✅ Reduce workers — 32 is too aggressive for 6GB GPU with GLM-OCR loaded
+  max_workers: 4
+  page_maxsize: 100
   region_maxsize: 0
 
   layout:
-    model_dir: PaddlePaddle/PP-DocLayoutV3_safetensors   # HuggingFace model ID (auto-downloaded ~400 MB)
-    id2label: null            # null = loaded from model weights at runtime
+    model_dir: PaddlePaddle/PP-DocLayoutV3_safetensors
+    threshold: 0.3
+    
+    # ✅ KEY FIX: Force layout to CPU so GLM-OCR gets full GPU
+    device: "cpu"
+    cuda_visible_devices: ""      # Hide GPU from PaddlePaddle entirely
+    
+    batch_size: 1                 # 1 page at a time on CPU
+    workers: 1
 
-    # label_task_mapping: maps layout labels → pipeline task type.
-    # task_type "abandon" = skip entirely; "ocr"/"table"/"formula"/"algorithm" = run OCR.
-    # Labels from PP-DocLayoutV3: abstract, algorithm, aside_text, chart, content,
-    # formula, doc_title, figure_title, footer, footnote, formula_number, header,
-    # image, number, paragraph_title, reference, reference_content, seal, table,
-    # text, vision_footnote
+    use_polygon: false
+    layout_nms: true
+    layout_unclip_ratio:
+      - 1.0
+      - 1.0
+
+    layout_merge_bboxes_mode:
+      0: large
+      1: large
+      2: large
+      3: large
+      4: large
+      5: large
+      6: large
+      7: large
+      8: large
+      9: large
+      10: large
+      11: large
+      12: large
+      13: large
+      14: large
+      15: large
+      16: large
+      17: large
+      18: small
+      19: large
+      20: large
+      21: large
+      22: large
+      23: large
+      24: large
+
     label_task_mapping:
-      ocr:
+      text:
         - abstract
         - aside_text
         - content
@@ -35,27 +75,66 @@ pipeline:
         - figure_title
         - footnote
         - paragraph_title
-        - reference
         - reference_content
         - text
         - vision_footnote
-        - chart
-        - image
         - seal
       table:
         - table
       formula:
         - formula
-      algorithm:
-        - algorithm
+      skip:
+        - chart
+        - image
       abandon:
         - header
         - footer
         - formula_number
         - number
+        - reference
+
+    id2label:
+      0: abstract
+      1: algorithm
+      2: aside_text
+      3: chart
+      4: content
+      5: display_formula
+      6: doc_title
+      7: figure_title
+      8: footer
+      9: footer_image
+      10: footnote
+      11: formula_number
+      12: header
+      13: header_image
+      14: image
+      15: inline_formula
+      16: number
+      17: paragraph_title
+      18: reference
+      19: reference_content
+      20: seal
+      21: table
+      22: text
+      23: vertical_text
+      24: vision_footnote
 
   result_formatter:
-    output_format: both       # json + markdown
+    output_format: both
+    enable_merge_formula_numbers: true
+    enable_merge_text_blocks: true
+    enable_format_bullet_points: true
 
   page_loader:
     max_tokens: 8192
+    temperature: 0.0
+    top_p: 0.00001
+    top_k: 1
+    repetition_penalty: 1.1
+    image_format: JPEG
+    min_pixels: 12544
+    max_pixels: 71372800
+    pdf_dpi: 150              # ✅ Reduce from 200 → less RAM per page
+    pdf_max_pages: null
+    pdf_verbose: false

@@ -16,6 +16,25 @@ logger = logging.getLogger(__name__)
 
 try:
     from glmocr import GlmOcr  # type: ignore[import]
+    import glmocr.ocr_client as _ocr_client
+
+    # ── Monkey-patch: fix empty prompt bug in glmocr SDK ─────────────────────
+    # The SDK sends images to Ollama but leaves prompt="" — the model returns
+    # nothing without an instruction. Inject the OCR prompt when it's missing.
+    _original_convert = _ocr_client.OCRClient._convert_to_ollama_generate
+
+    def _patched_convert(self, request_data):  # type: ignore[misc]
+        result = _original_convert(self, request_data)
+        if not result.get("prompt"):
+            result["prompt"] = (
+                "Please carefully read and transcribe ALL text visible in this image. "
+                "Output only the transcribed text, preserving the original layout."
+            )
+        return result
+
+    _ocr_client.OCRClient._convert_to_ollama_generate = _patched_convert
+    # ─────────────────────────────────────────────────────────────────────────
+
     _GLMOCR_AVAILABLE = True
 except ImportError:
     _GLMOCR_AVAILABLE = False

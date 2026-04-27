@@ -1,0 +1,6 @@
+data/
+docs/
+notebooks/
+tests/
+TESTING.md
+LIGHTNING_AI_DEPLOY.md

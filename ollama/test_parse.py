@@ -19,6 +19,22 @@ import sys
 import time
 from pathlib import Path
 
+
+import glmocr.ocr_client as _ocr_client
+
+_original_convert = _ocr_client.OCRClient._convert_to_ollama_generate
+
+def _patched_convert(self, request_data):
+    result = _original_convert(self, request_data)
+    if not result.get("prompt"):
+        result["prompt"] = (
+            "Please carefully read and transcribe ALL text visible in this image. "
+            "Output only the transcribed text, preserving the original layout as much as possible."
+        )
+    return result
+
+_ocr_client.OCRClient._convert_to_ollama_generate = _patched_convert
+
 # ── Attempt to import glmocr SDK ──────────────────────────────────────────────
 try:
     from glmocr import GlmOcr
