@@ -277,9 +277,7 @@ Screenshots:
 
 | Document | Description |
 |---|---|
-| [`docs/runbook.md`](docs/runbook.md) | Full operational runbook — services, ingestion, troubleshooting |
-| [`docs/complete_learning_guide.md`](docs/complete_learning_guide.md) | Architecture deep-dive, every issue faced and how it was fixed |
-
+| [`docs/runbook.md`](docs/runbook.md) | Full operational runbook — services, ingestion, troubleshooting
 ---
 
 ## Project Structure
