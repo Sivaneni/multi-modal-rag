@@ -8,12 +8,14 @@ from loguru import logger
 
 from doc_parser.api.dependencies import (
     get_embedder_dep,
-    get_openai_client,
+    get_llm_client,
     get_reranker_dep,
     get_store,
 )
 from doc_parser.api.schemas import ChunkResult, GenerateRequest, GenerateResponse
 from doc_parser.config import get_settings
+from doc_parser.retrieval.graph_context import fetch_graph_context
+from doc_parser.retrieval.graph_formatter import format_graph_context
 
 router = APIRouter()
 
@@ -69,7 +71,7 @@ async def generate(req: GenerateRequest) -> GenerateResponse:
     store = get_store()
     embedder = get_embedder_dep()
     reranker = get_reranker_dep()
-    client = get_openai_client()
+    client = get_llm_client()
 
     top_n = req.top_n if req.top_n is not None else settings.reranker_top_n
 
@@ -115,8 +117,25 @@ async def generate(req: GenerateRequest) -> GenerateResponse:
                 text = caption or summary
         else:
             text = c.get("text", "") or c.get("caption") or ""
-        context_parts.append(f"[page {page}] {text}")
+        src = c.get("source_file", "unknown")
+        context_parts.append(f"[{src} | page {page}] {text}")
     context = "\n\n".join(context_parts)
+
+    # Graph context — fetched from Neo4j when configured, silently skipped otherwise
+    graph_context_str: str | None = None
+    if settings.neo4j_uri and settings.neo4j_password:
+        try:
+            from doc_parser.ingestion.neo4j_ingestor import get_neo4j_driver
+            source_files = list({c.get("source_file", "") for c in candidates if c.get("source_file")})
+            password = settings.neo4j_password.get_secret_value()
+            driver = get_neo4j_driver(settings.neo4j_uri, settings.neo4j_username, password)
+            graph_data = fetch_graph_context(source_files, driver)
+            driver.close()
+            graph_context_str = format_graph_context(graph_data) or None
+            if graph_context_str:
+                context = graph_context_str + "\n\n" + context
+        except Exception:
+            logger.exception("Graph context enrichment failed — continuing without it")
 
     system_prompt = req.system_prompt or _DEFAULT_SYSTEM_PROMPT
 
@@ -160,4 +179,5 @@ async def generate(req: GenerateRequest) -> GenerateResponse:
         sources=sources,
         total_candidates=total_candidates,
         latency_ms=round(latency_ms, 2),
+        graph_context=graph_context_str,
     )

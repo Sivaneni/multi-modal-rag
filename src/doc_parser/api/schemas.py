@@ -106,6 +106,7 @@ class GenerateResponse(BaseModel):
     sources: list[ChunkResult]
     total_candidates: int
     latency_ms: float
+    graph_context: str | None = None
 
 
 class DeleteCollectionResponse(BaseModel):

@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 
 from pydantic import SecretStr, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -38,6 +38,15 @@ class Settings(BaseSettings):
     qdrant_api_key: SecretStr | None = None
     qdrant_collection_name: str = "documents"
 
+    # LLM provider for generation / captioning / graph extraction
+    llm_provider: str = "meshapi"  # "meshapi" | "openai"
+    mesh_api_key: SecretStr | None = None
+
+    # Neo4j (optional — graph extraction is skipped when neo4j_uri is not set)
+    neo4j_uri: str | None = None
+    neo4j_username: str = "neo4j"
+    neo4j_password: SecretStr | None = None
+
     # Reranker
     reranker_backend: str = "openai"  # "jina" | "openai" | "bge" | "qwen"
     reranker_top_n: int = 5
@@ -59,6 +68,18 @@ class Settings(BaseSettings):
 
     # Logging
     log_json: bool = False
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        **kwargs: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        # .env file takes priority over system environment variables
+        return init_settings, dotenv_settings, env_settings
 
     @model_validator(mode="after")
     def _validate_backend(self) -> Settings:
@@ -87,6 +108,35 @@ def get_settings() -> Settings:
     if _settings is None:
         _settings = Settings()
     return _settings
+
+
+_MESHAPI_BASE_URL = "https://api.meshapi.ai/v1"
+
+
+def make_async_llm_client() -> "AsyncOpenAI":  # type: ignore[name-defined]
+    """Return an AsyncOpenAI client pointed at the configured LLM provider."""
+    from openai import AsyncOpenAI
+    settings = get_settings()
+    if settings.llm_provider == "meshapi" and settings.mesh_api_key:
+        return AsyncOpenAI(
+            api_key=settings.mesh_api_key.get_secret_value(),
+            base_url=_MESHAPI_BASE_URL,
+        )
+    api_key = settings.openai_api_key.get_secret_value() if settings.openai_api_key else None
+    return AsyncOpenAI(api_key=api_key)
+
+
+def make_sync_llm_client() -> "OpenAI":  # type: ignore[name-defined]
+    """Return a sync OpenAI client pointed at the configured LLM provider."""
+    from openai import OpenAI
+    settings = get_settings()
+    if settings.llm_provider == "meshapi" and settings.mesh_api_key:
+        return OpenAI(
+            api_key=settings.mesh_api_key.get_secret_value(),
+            base_url=_MESHAPI_BASE_URL,
+        )
+    api_key = settings.openai_api_key.get_secret_value() if settings.openai_api_key else None
+    return OpenAI(api_key=api_key)
 
 
 def configure_logging(level: str = "INFO") -> None:

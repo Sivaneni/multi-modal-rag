@@ -5,7 +5,7 @@ from functools import lru_cache
 
 from openai import AsyncOpenAI
 
-from doc_parser.config import get_settings
+from doc_parser.config import get_settings, make_async_llm_client
 from doc_parser.ingestion.embedder import BaseEmbedder, get_embedder
 from doc_parser.ingestion.vector_store import QdrantDocumentStore
 from doc_parser.retrieval.reranker import BaseReranker, get_reranker
@@ -13,10 +13,16 @@ from doc_parser.retrieval.reranker import BaseReranker, get_reranker
 
 @lru_cache
 def get_openai_client() -> AsyncOpenAI:
-    """Return a cached AsyncOpenAI client."""
+    """Return a cached AsyncOpenAI client (embeddings only — always OpenAI)."""
     settings = get_settings()
     api_key = settings.openai_api_key.get_secret_value() if settings.openai_api_key else None
     return AsyncOpenAI(api_key=api_key)
+
+
+@lru_cache
+def get_llm_client() -> AsyncOpenAI:
+    """Return a cached LLM client for generation/captioning (MeshAPI or OpenAI per LLM_PROVIDER)."""
+    return make_async_llm_client()
 
 
 @lru_cache

@@ -12,7 +12,7 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from loguru import logger
 from qdrant_client.models import SparseVector
 
-from doc_parser.api.dependencies import get_embedder_dep, get_openai_client, get_store
+from doc_parser.api.dependencies import get_embedder_dep, get_llm_client, get_store
 from doc_parser.api.schemas import IngestRequest, IngestResponse
 from doc_parser.chunker import Chunk, document_aware_chunking
 from doc_parser.config import get_settings
@@ -83,7 +83,7 @@ async def _run_ingest(
             ``pdf_path.name`` when not provided.
     """
     settings = get_settings()
-    client = get_openai_client()
+    client = get_llm_client()
     embedder = get_embedder_dep()
     store = get_store()
 
@@ -135,6 +135,27 @@ async def _run_ingest(
     # 5. Ensure collection exists then upsert
     await store.create_collection(overwrite=overwrite)
     upserted = await store.upsert_chunks(chunks, dense, sparse)
+
+    # 6. Extract entities → Neo4j (skipped when NEO4J_URI is not configured)
+    if settings.neo4j_uri and settings.neo4j_password:
+        try:
+            from doc_parser.ingestion.graph_extractor import extract_graph_components
+            from doc_parser.ingestion.neo4j_ingestor import get_neo4j_driver, ingest_to_neo4j
+
+            loop = asyncio.get_running_loop()
+            components = await loop.run_in_executor(
+                None, extract_graph_components, chunks
+            )
+            password = settings.neo4j_password.get_secret_value()
+            driver = get_neo4j_driver(settings.neo4j_uri, settings.neo4j_username, password)
+            ingest_to_neo4j(components, driver)
+            driver.close()
+            logger.info(
+                "Graph: {} nodes, {} relationships for {}",
+                len(components.nodes), len(components.relationships), source_name,
+            )
+        except Exception:
+            logger.exception("Neo4j graph extraction failed for {} — continuing", source_name)
 
     latency_ms = (time.perf_counter() - t0) * 1000
     modality_counts = dict(Counter(c.modality for c in chunks))

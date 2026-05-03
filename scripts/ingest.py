@@ -14,7 +14,7 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 
 from doc_parser.chunker import Chunk, structure_aware_chunking
-from doc_parser.config import configure_logging, get_settings
+from doc_parser.config import configure_logging, get_settings, make_async_llm_client
 from doc_parser.ingestion.embedder import embed_chunks, get_embedder
 from doc_parser.ingestion.image_captioner import enrich_image_chunks
 from doc_parser.ingestion.vector_store import QdrantDocumentStore
@@ -93,13 +93,8 @@ async def _ingest_file(
 
     Returns a summary dict with counts by modality.
     """
-    from openai import AsyncOpenAI
-
     settings = get_settings()
-    openai_key = (
-        settings.openai_api_key.get_secret_value() if settings.openai_api_key else None
-    )
-    openai_client = AsyncOpenAI(api_key=openai_key)
+    llm_client = make_async_llm_client()
     embedder = get_embedder(settings)
 
     task = progress.add_task(f"[cyan]{file_path.name}[/cyan]", total=None)
@@ -126,7 +121,7 @@ async def _ingest_file(
         all_chunks = await enrich_image_chunks(
             chunks=all_chunks,
             pdf_path=file_path,
-            client=openai_client,
+            client=llm_client,
         )
 
     # Step 4: Embed (dense + sparse)
@@ -144,6 +139,18 @@ async def _ingest_file(
         dense_embeddings=dense_embeddings,
         sparse_vectors=sparse_vectors,
     )
+
+    # Step 6: Extract entities → Neo4j (skipped when NEO4J_URI is not configured)
+    if settings.neo4j_uri:
+        progress.update(task, description=f"[cyan]{file_path.name}[/cyan] — extracting graph entities")
+        from doc_parser.ingestion.graph_extractor import extract_graph_components
+        from doc_parser.ingestion.neo4j_ingestor import get_neo4j_driver, ingest_to_neo4j
+
+        components = extract_graph_components(chunks=all_chunks)
+        password = settings.neo4j_password.get_secret_value() if settings.neo4j_password else ""
+        driver = get_neo4j_driver(settings.neo4j_uri, settings.neo4j_username, password)
+        ingest_to_neo4j(components, driver)
+        driver.close()
 
     progress.remove_task(task)
 

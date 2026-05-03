@@ -30,6 +30,10 @@ data/processed/
 output/
 models/
 test_data/
+docs/
+data/chunks
+
+graphify-out/
 
 # ── Ollama local pipeline output ──────────────────────────────────────────────
 ollama/output/
