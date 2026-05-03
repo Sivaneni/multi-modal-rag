@@ -236,6 +236,15 @@ Screenshots:
 - Ask question → Grounding badge + Knowledge graph context expander + Source chunk verification
 - Multi-document warning when answer crosses files
 
+  <img width="1896" height="955" alt="image" src="https://github.com/user-attachments/assets/803e4dbe-fcb2-47bb-b340-ca621108d2e9" />
+  <img width="1433" height="821" alt="image" src="https://github.com/user-attachments/assets/643a8724-3e86-4b4a-b720-5298a41a1b8a" />
+  <img width="1906" height="792" alt="image" src="https://github.com/user-attachments/assets/4c109b28-8f67-4f86-9461-e08def570a9c" />
+  <img width="1157" height="427" alt="image" src="https://github.com/user-attachments/assets/7c42c5be-abfd-43fc-bab7-8b53aa18fb23" />
+  
+
+
+
+
 ---
 
 ## Team
