@@ -31,6 +31,7 @@ output/
 models/
 test_data/
 docs/
+!docs/runbook.md
 data/chunks
 
 graphify-out/
@@ -69,3 +70,7 @@ pp_doclayout_v3_glm_ocr_implementation_plan.md
 # ── Claude Code local config ──────────────────────────────────────────────────
 .claude/
 docs/ARIZE_INTEGRATION.md
+*.bak
+*.bak2
+scalene-profile.*
+logs_*.txt

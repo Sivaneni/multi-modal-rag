@@ -60,7 +60,7 @@ def _save_chunks_to_disk(
                 },
             })
 
-        out_path.write_text(json.dumps(records, indent=2, ensure_ascii=False))
+        out_path.write_text(json.dumps(records, indent=2, ensure_ascii=False), encoding="utf-8")
         logger.info("Saved {} chunks to {}", len(records), out_path)
     except Exception:
         logger.warning("Failed to save chunks debug file for {}", source_name, exc_info=True)

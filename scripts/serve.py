@@ -2,7 +2,24 @@
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import sys
+
+# Print a Python traceback (all threads) on native crashes like segfaults.
+faulthandler.enable(all_threads=True)
+
+# ── Windows CPU-torch stability (layout model runs in a GLM-OCR worker thread) ──
+# PP-DocLayoutV3 segfaulted (access violation in mask_to_box_coordinate) when
+# torch's OpenMP/MKL thread pool ran inside a background Python thread.
+# Must be set BEFORE torch is imported. Override via env if needed.
+import os
+import threading
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+# Bigger stacks for threads created from here on (GLM-OCR pipeline workers).
+threading.stack_size(64 * 1024 * 1024)
 from pathlib import Path
 
 # Ensure src/ is on the path when run directly

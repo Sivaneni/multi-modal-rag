@@ -1,64 +1,118 @@
+# GLM-OCR config — self-hosted via local Ollama (Windows laptop GPU)
+# Aligned with upstream: https://github.com/zai-org/GLM-OCR/blob/main/glmocr/config.yaml
+# Only overrides are listed; everything else falls back to SDK defaults.
+
+logging:
+  level: INFO                 # set DEBUG to see per-request timing + connection retries
+
 pipeline:
   maas:
-    enabled: false          # Disable Z.AI cloud API
+    enabled: false            # Disable Z.AI cloud API -> use ocr_api below
 
   ocr_api:
-    api_host: localhost
+    api_host: 127.0.0.1       # NOT "localhost" — avoids slow IPv6 (::1) fallback on Windows
     api_port: 11434
-    api_path: /api/generate   # Ollama's native endpoint (NOT the OpenAI-compat one)
-    model: glm-ocr:latest     # Must match what you pulled
-    api_mode: ollama_generate  # Essential — prevents 502 errors
-    
+    api_path: /api/generate   # Ollama native endpoint (NOT the OpenAI-compat one)
+    model: glm-ocr:latest     # Must match `ollama list`
+    api_mode: ollama_generate # Avoids 502s on vision requests via /v1/chat/completions
 
-  enable_layout: true         # PP-DocLayout-V3 layout detection
-                              # Requires: uv pip install "glmocr[layout]"
+    # Timeouts (seconds). Defaults are 30 / 120 — too short for a cold model load
+    # (measured: 21.5s load + 12s prompt eval = 33.6s) and for queued regions.
+    connect_timeout: 300      # how long the startup health-check keeps retrying
+    request_timeout: 600      # per region OCR request
 
-  # Bug fix: region_maxsize must be an int (0 = unlimited). SDK default of null
-  # causes Queue(maxsize=None) → TypeError in error handler.
+    # Retries: default 2. Keep low — retrying a timed-out request just re-queues work.
+    retry_max_attempts: 2
+    retry_status_codes: [429, 500, 502, 503, 504]
+
+    connection_pool_size: 4   # must be >= max_workers (default 128 is pointless locally)
+
+  # Parallel region requests. Default 32 floods a single-GPU Ollama and every
+  # queued request burns its timeout. Match this to OLLAMA_NUM_PARALLEL.
+  max_workers: 2
+
+  page_maxsize: 100
+  # Bug fix: must be an int (0 = unlimited). null -> Queue(maxsize=None) -> TypeError.
   region_maxsize: 0
 
-  layout:
-    model_dir: PaddlePaddle/PP-DocLayoutV3_safetensors   # HuggingFace model ID (auto-downloaded ~400 MB)
-    id2label: null            # null = loaded from model weights at runtime
+  page_loader:
+    max_tokens: 4096          # default 8192; caps runaway generations on small regions
+    temperature: 0.0
+    top_p: 0.00001
+    top_k: 1
+    repetition_penalty: 1.1
+    image_format: JPEG
+    # Cap region image size. SDK default max_pixels is 71 MP (effectively no cap).
+    # ~784 px per vision token -> 2,352,000 px ≈ 3,000 image tokens max, so
+    # image + max_tokens(4096) fits in num_ctx 8192 (set in pipeline.py).
+    max_pixels: 2352000
 
-    # label_task_mapping: maps layout labels → pipeline task type.
-    # task_type "abandon" = skip entirely; "ocr"/"table"/"formula"/"algorithm" = run OCR.
-    # Labels from PP-DocLayoutV3: abstract, algorithm, aside_text, chart, content,
-    # formula, doc_title, figure_title, footer, footnote, formula_number, header,
-    # image, number, paragraph_title, reference, reference_content, seal, table,
-    # text, vision_footnote
 
-    
-    label_task_mapping:
-      ocr:
-        - abstract
-        - aside_text
-        - content
-        - doc_title
-        - figure_title
-        - footnote
-        - paragraph_title
-        - reference
-        - reference_content
-        - text
-        - vision_footnote
-        - chart
-        - image
-        - seal
-      table:
-        - table
-      formula:
-        - formula
-      algorithm:
-        - algorithm
-      abandon:
-        - header
-        - footer
-        - formula_number
-        - number
+    # These keys MUST match the task names in layout.label_task_mapping below.
+    # A task with no prompt here is sent with an EMPTY prompt -> slow, rambling output.
+    task_prompt_mapping:
+      text: "Text Recognition:"
+      table: "Table Recognition:"
+      formula: "Formula Recognition:"
+
+    pdf_dpi: 150              # default 200; plenty for text PDFs, smaller images = faster OCR
+    pdf_max_pages: null          # default 100; null = no limit (but Ollama may OOM on large PDFs)
 
   result_formatter:
     output_format: both       # json + markdown
+    enable_merge_formula_numbers: true
+    enable_merge_text_blocks: true
+    enable_format_bullet_points: true
 
-  page_loader:
-    max_tokens: 8192
+  enable_layout: true         # PP-DocLayout-V3; requires: uv pip install "glmocr[layout]"
+
+  layout:
+    model_dir: PaddlePaddle/PP-DocLayoutV3_safetensors   # HF id, auto-downloaded (~400 MB)
+    threshold: 0.3
+    batch_size: 1
+    workers: 1
+    # Layout model on CPU: on the RTX 3050 6 GB, Ollama (glm-ocr + 8k ctx x 2
+    # parallel slots) leaves too little VRAM -> "Memory allocation failure" /
+    # "CUDA error: unknown error" in layout detection. OCR stays on GPU via Ollama.
+    device: cpu
+    cuda_visible_devices: "0"
+    use_polygon: false
+    layout_nms: true
+
+    id2label: null            # null = read from model weights at runtime
+
+    # Task types the SDK understands: text / table / formula / skip / abandon.
+    #   skip    = keep the region in output but don't OCR it (images, charts)
+    #   abandon = drop the region entirely
+    # Labels are PP-DocLayoutV3 names (formula is display_formula/inline_formula).
+    label_task_mapping:
+      text:
+        - abstract
+        - algorithm
+        - content
+        - doc_title
+        - figure_title
+        - paragraph_title
+        - reference_content
+        - text
+        - vertical_text
+        - vision_footnote
+        - seal
+        - formula_number
+        - footnote            # you kept footnotes; upstream abandons them
+        - aside_text          # you kept aside text; upstream abandons it
+        - reference           # you kept references; upstream abandons them
+      table:
+        - table
+      formula:
+        - display_formula
+        - inline_formula
+      skip:
+        - chart
+        - image
+      abandon:
+        - header
+        - footer
+        - number
+        - footer_image
+        - header_image

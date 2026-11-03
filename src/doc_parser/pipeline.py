@@ -33,6 +33,143 @@ try:
         return result
 
     _ocr_client.OCRClient._convert_to_ollama_generate = _patched_convert
+
+    # ── Monkey-patch: force Ollama context size + keep_alive per request ────
+    # The SDK never sends num_ctx, so Ollama falls back to its default (4096).
+    # Image tokens (~2-3k for a large region) + num_predict (4096) overflow
+    # that, causing truncated prompts / runaway generations / read timeouts.
+    # Setting it per request makes this independent of OLLAMA_CONTEXT_LENGTH.
+    import os as _os
+    import time as _time
+    import threading as _threading
+
+    # 10240: glm-ocr GGUF emits empty ``` fences at small contexts (4096); 10k is
+    # the commonly reported working value.
+    _OLLAMA_NUM_CTX = int(_os.getenv("OLLAMA_NUM_CTX", "10240"))
+    _OLLAMA_KEEP_ALIVE = _os.getenv("OLLAMA_KEEP_ALIVE", "30m")
+    _convert_with_prompt = _ocr_client.OCRClient._convert_to_ollama_generate
+
+    # glm-ocr GGUF (Ollama) often falls into repetition loops and burns the
+    # whole num_predict budget (4096 tok ≈ 45s/region on an RTX 3050). A region
+    # can't contain more text than its pixels allow, so cap num_predict by the
+    # crop's vision-token count (~784 px per token).
+    _OUT_PER_VISION_TOKEN = float(_os.getenv("OCR_OUT_PER_VISION_TOKEN", "3"))
+    _MIN_NUM_PREDICT = int(_os.getenv("OCR_MIN_NUM_PREDICT", "384"))
+
+    def _adaptive_num_predict(images, current):
+        if not images:
+            return current
+        try:
+            import base64
+            from io import BytesIO
+            from PIL import Image
+
+            with Image.open(BytesIO(base64.b64decode(images[0]))) as im:
+                w, h = im.size
+            vision_tokens = (w * h) / 784.0
+            cap = max(_MIN_NUM_PREDICT, int(vision_tokens * _OUT_PER_VISION_TOKEN) + 128)
+            return min(int(current), cap) if current else cap
+        except Exception:
+            return current
+
+    def _patched_convert_ctx(self, request_data):  # type: ignore[misc]
+        result = _convert_with_prompt(self, request_data)
+        opts = result.setdefault("options", {})
+        opts["num_ctx"] = _OLLAMA_NUM_CTX
+        opts["num_predict"] = _adaptive_num_predict(
+            result.get("images"), opts.get("num_predict", 4096)
+        )
+        result["keep_alive"] = _OLLAMA_KEEP_ALIVE
+        return result
+
+    _ocr_client.OCRClient._convert_to_ollama_generate = _patched_convert_ctx
+
+    # ── Monkey-patch: per-region progress logging ────────────────────────────
+    # The SDK is silent at INFO while OCR runs; log each region so a long
+    # ingest doesn't look hung.
+    _original_process = _ocr_client.OCRClient.process
+    _region_counter = {"n": 0}
+    _region_lock = _threading.Lock()
+    _last_stats = _threading.local()  # per worker thread: raw Ollama stats
+
+    def _capture_ollama_stats(resp, *args, **kwargs):  # requests response hook
+        try:
+            data = resp.json()
+            _last_stats.value = {
+                k: data.get(k)
+                for k in ("prompt_eval_count", "eval_count", "done_reason",
+                          "prompt_eval_duration", "eval_duration", "load_duration")
+            }
+        except Exception:
+            _last_stats.value = None
+        return resp
+
+    _original_make_session = _ocr_client.OCRClient._make_session
+
+    def _patched_make_session(self):  # type: ignore[misc]
+        session = _original_make_session(self)
+        session.hooks["response"].append(_capture_ollama_stats)
+        return session
+
+    _ocr_client.OCRClient._make_session = _patched_make_session
+
+    def _trim_repetition(text: str) -> str:
+        """Drop the partial last line and collapse repeated trailing line cycles
+        (e.g. the same line or a ``` fence repeated hundreds of times)."""
+        lines = text.split("\n")
+        if len(lines) > 1:
+            lines = lines[:-1]  # last line was cut mid-token by num_predict
+        for period in range(1, 11):
+            while len(lines) >= 2 * period and lines[-period:] == lines[-2 * period:-period]:
+                lines = lines[:-period]
+        # strip dangling empty/fence-only lines left at the tail
+        while lines and lines[-1].strip() in ("", "```"):
+            lines = lines[:-1]
+        return "\n".join(lines)
+
+    def _patched_process(self, request_data):  # type: ignore[misc]
+        with _region_lock:
+            _region_counter["n"] += 1
+            n = _region_counter["n"]
+        t0 = _time.perf_counter()
+        _last_stats.value = None
+        response, status = _original_process(self, request_data)
+        dt = _time.perf_counter() - t0
+        if status == 200:
+            st = getattr(_last_stats, "value", None) or {}
+            ns = 1e9
+            text = ""
+            try:
+                text = response["choices"][0]["message"]["content"] or ""
+            except Exception:
+                pass
+            logger.info(
+                "OCR region #%d done in %.1fs | in=%s tok (%.1fs) out=%s tok (%.1fs) "
+                "load=%.1fs stop=%s chars=%d",
+                n, dt,
+                st.get("prompt_eval_count"), (st.get("prompt_eval_duration") or 0) / ns,
+                st.get("eval_count"), (st.get("eval_duration") or 0) / ns,
+                (st.get("load_duration") or 0) / ns,
+                st.get("done_reason"), len(text),
+            )
+            if st.get("done_reason") == "length":
+                cleaned = _trim_repetition(text)
+                try:
+                    response["choices"][0]["message"]["content"] = cleaned
+                except Exception:
+                    pass
+                logger.warning(
+                    "OCR region #%d hit num_predict (repetition loop) — trimmed %d -> %d chars",
+                    n, len(text), len(cleaned),
+                )
+        else:
+            logger.warning(
+                "OCR region #%d failed (HTTP %s) after %.1fs: %s",
+                n, status, dt, str(response.get("error", ""))[:200],
+            )
+        return response, status
+
+    _ocr_client.OCRClient.process = _patched_process
     # ─────────────────────────────────────────────────────────────────────────
 
     _GLMOCR_AVAILABLE = True
