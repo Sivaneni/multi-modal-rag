@@ -1,3 +1,33 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Single-GPU L40S (48 GB) stack — everything local, no Ollama by default.
+#
+#   vllm-ocr  GLM-OCR 0.9B (original weights, MTP)     ~0.14 of GPU  (~6.5 GB)
+#   vllm      Qwen3-VL-8B-Instruct-FP8 (generation)    ~0.50 of GPU  (~23 GB)
+#   app       Qwen3-VL embed 2B + rerank 2B + layout   ~12-14 GB (PyTorch)
+#   headroom                                           ~3-4 GB
+#
+# Start (local LLM):
+#   COMPOSE_PROFILES=local-llm docker compose -f docker-compose.gpu.yml up -d
+# Start order is enforced by healthchecks: vllm-ocr -> vllm -> app.
+# Two vLLM engines profiling free GPU memory at the same time can over-commit,
+# so they must not start in parallel.
+# ─────────────────────────────────────────────────────────────────────────────
+
+x-gpu: &gpu
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: 1
+            capabilities: [gpu]
+
+x-vllm-healthcheck: &vllm-healthcheck
+  interval: 15s
+  timeout: 10s
+  retries: 20
+  start_period: 600s   # first start downloads weights + captures CUDA graphs
+
 services:
   app:
     build:
@@ -12,16 +42,19 @@ services:
       - RERANKER_BACKEND=qwen
       - QWEN_EMBEDDING_MODEL=Qwen/Qwen3-VL-Embedding-2B
       - EMBEDDING_DIMENSIONS=2048
+      - PARSER_BACKEND=ollama        # "ollama" = self-hosted GLM-OCR (served by vLLM here)
+      # Models live in-process: >1 worker loads a second copy of embedder/reranker/layout into VRAM.
+      - API_WORKERS=1
     volumes:
       - ./data:/app/data
       - ./output:/app/output
       - ./config.yaml:/app/config.yaml:ro
-      - ./ollama/config.docker.yaml:/app/ollama/config.yaml:ro
+      - ./ollama/config.vllm.yaml:/app/ollama/config.yaml:ro   # GLM-OCR via vLLM
       - huggingface_cache:/root/.cache/huggingface
     depends_on:
       qdrant:
         condition: service_started
-      ollama:
+      vllm-ocr:
         condition: service_healthy
       vllm:
         condition: service_healthy
@@ -29,14 +62,10 @@ services:
       vllm-4bit:
         condition: service_healthy
         required: false
-    # PP-DocLayoutV3 runs on GPU — same device as Ollama (GLM-OCR).
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+      ollama:
+        condition: service_healthy
+        required: false
+    <<: *gpu
 
   qdrant:
     image: qdrant/qdrant:v1.17.0
@@ -48,73 +77,72 @@ services:
     environment:
       - QDRANT__SERVICE__GRPC_PORT=6334
 
-  ollama:
-    image: ollama/ollama:latest
+  # ── GLM-OCR on vLLM (replaces Ollama GGUF, which loops on most regions) ────
+  vllm-ocr:
+    build:
+      context: .
+      dockerfile: Dockerfile.vllm
+    image: multimodal-rag/vllm:0.19.0
+    ipc: host
     ports:
-      - "11434:11434"
-    volumes:
-      - ollama_models:/root/.ollama
+      - "127.0.0.1:8080:8080"        # host-local only, for debugging
     environment:
-      # Allow 4 concurrent OCR region requests — glm-ocr is ~2 GB VRAM,
-      # 4 parallel slots use ~8 GB leaving 8 GB headroom on a T4 (16 GB).
-      - OLLAMA_NUM_PARALLEL=4
-      # Keep model loaded between requests (no reload overhead per region)
-      - OLLAMA_KEEP_ALIVE=-1
-      # Enable Flash Attention — L4 is Ada Lovelace (compute 8.9), fully supported.
-      # Speeds up attention computation during GLM-OCR inference.
-      - OLLAMA_FLASH_ATTENTION=1
-      # Set context window to 16384 to prevent OCR truncation.
-      # config.docker.yaml requests max_tokens=8192; Ollama's vram-based default
-      # was 4096 — too small for dense pages. VRAM budget: model=2.2 GiB +
-      # KV cache (16384 ctx × 4 slots) ≈ 4 GiB = ~6.2 GiB total of 22.5 GiB.
-      - OLLAMA_CONTEXT_LENGTH=16384
+      - HF_TOKEN=${HF_TOKEN:-}
+    volumes:
+      - huggingface_cache:/root/.cache/huggingface
+    command: >
+      --model zai-org/GLM-OCR
+      --served-model-name glm-ocr
+      --port 8080
+      --speculative-config '{"method": "mtp", "num_speculative_tokens": 3}'
+      --gpu-memory-utilization 0.14
+      --max-model-len 16384
+      --max-num-seqs 128
+      --max-num-batched-tokens 16384
     healthcheck:
-      test: ["CMD", "ollama", "list"]
-      interval: 10s
-      timeout: 5s
-      retries: 6
-      start_period: 30s
-    # GLM-OCR (0.9B) offloaded entirely to GPU — ~2 GB VRAM
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+      <<: *vllm-healthcheck
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health')\""]
+    <<: *gpu
 
+  # ── Qwen3-VL-8B FP8 for generation / table captions ───────────────────────
   vllm:
-    image: vllm/vllm-openai:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.vllm
+    image: multimodal-rag/vllm:0.19.0   # same image as vllm-ocr
     profiles:
       - local-llm
+    ipc: host
     ports:
       - "8001:8000"
     environment:
       - HF_TOKEN=${HF_TOKEN:-}
     volumes:
       - huggingface_cache:/root/.cache/huggingface
+    # FP8 weights (~10 GB) use the L40S's native FP8 tensor cores and leave
+    # ~60% more VRAM for KV cache than BF16 -> more concurrent users.
+    # limit-mm-per-prompt image=6 must be >= RERANKER_TOP_N (generate.py sends
+    # one image block per retrieved image/table chunk).
     command: >
-      --model cyankiwi/Qwen3-VL-4B-Instruct-AWQ-4bit
+      --model Qwen/Qwen3-VL-8B-Instruct-FP8
+      --served-model-name qwen3-vl-8b
       --port 8000
-      --dtype bfloat16
-      --gpu-memory-utilization 0.3167
-      --max-model-len 8192
-      --mm-encoder-tp-mode data
- #     --limit-mm-per-prompt image=10
+      --api-key ${VLLM_API_KEY:-local-token}
+      --gpu-memory-utilization 0.50
+      --max-model-len 16384
+      --max-num-seqs 32
+      --max-num-batched-tokens 8192
+      --enable-prefix-caching
+      --limit-mm-per-prompt '{"image": 6, "video": 0}'
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 10
-      start_period: 300s
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+      <<: *vllm-healthcheck
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+    depends_on:
+      vllm-ocr:
+        condition: service_healthy
+    <<: *gpu
 
+  # ── L4 (24 GB) fallback — unchanged ────────────────────────────────────────
   vllm-4bit:
     image: vllm/vllm-openai:latest
     profiles:
@@ -140,13 +168,30 @@ services:
       timeout: 10s
       retries: 10
       start_period: 240s
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+    <<: *gpu
+
+  # ── Legacy GLM-OCR via Ollama (opt-in: COMPOSE_PROFILES=ollama) ────────────
+  # Only used if you point the app back at ollama/config.docker.yaml.
+  ollama:
+    image: ollama/ollama:latest
+    profiles:
+      - ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    environment:
+      - OLLAMA_NUM_PARALLEL=4
+      - OLLAMA_KEEP_ALIVE=-1
+      - OLLAMA_FLASH_ATTENTION=1
+      - OLLAMA_CONTEXT_LENGTH=16384
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    <<: *gpu
 
   visualizer:
     build:

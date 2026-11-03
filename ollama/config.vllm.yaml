@@ -1,0 +1,93 @@
+# GLM-OCR SDK config — self-hosted GLM-OCR served by vLLM (docker-compose.gpu.yml
+# service `vllm-ocr`). Mounted into the app container as /app/ollama/config.yaml.
+# Laptop/Ollama setup stays in ollama/config.yaml; legacy Docker+Ollama in
+# ollama/config.docker.yaml.
+
+pipeline:
+  maas:
+    enabled: false               # self-hosted, not Z.AI cloud
+
+  ocr_api:
+    api_host: vllm-ocr           # compose service name (127.0.0.1 outside Docker)
+    api_port: 8080
+    api_path: /v1/chat/completions
+    api_mode: openai             # vLLM speaks the OpenAI API natively
+    model: glm-ocr               # must equal vllm-ocr --served-model-name
+    connect_timeout: 900         # compose healthcheck gates startup; this is a backstop
+    request_timeout: 300         # per region; normal regions take ~1s on vLLM
+    retry_max_attempts: 2
+    retry_status_codes: [429, 500, 502, 503, 504]
+    connection_pool_size: 64     # >= max_workers
+
+  # Parallel region requests PER document. vLLM batches them (continuous
+  # batching); vllm-ocr --max-num-seqs 128 leaves room for ~4 concurrent ingests.
+  max_workers: 32
+  page_maxsize: 100
+  region_maxsize: 0              # must be int (null -> Queue(maxsize=None) TypeError)
+
+  page_loader:
+    max_tokens: 8192             # upstream default
+    temperature: 0.0
+    top_p: 0.00001
+    top_k: 1
+    repetition_penalty: 1.1
+    image_format: JPEG
+    # Keys MUST match the task names in layout.label_task_mapping.
+    task_prompt_mapping:
+      text: "Text Recognition:"
+      table: "Table Recognition:"
+      formula: "Formula Recognition:"
+    pdf_dpi: 200                 # upstream default — best accuracy
+    pdf_max_pages: null
+
+  result_formatter:
+    output_format: both
+    enable_merge_formula_numbers: true
+    enable_merge_text_blocks: true
+    enable_format_bullet_points: true
+
+  enable_layout: true
+
+  layout:
+    model_dir: PaddlePaddle/PP-DocLayoutV3_safetensors
+    threshold: 0.3
+    batch_size: 1
+    workers: 1
+    device: cuda                 # plenty of VRAM on the L40S
+    use_polygon: false
+    layout_nms: true
+    id2label: null
+
+    # Task types the SDK understands: text / table / formula / skip / abandon.
+    # Labels are PP-DocLayoutV3 names.
+    label_task_mapping:
+      text:
+        - abstract
+        - algorithm
+        - content
+        - doc_title
+        - figure_title
+        - paragraph_title
+        - reference_content
+        - text
+        - vertical_text
+        - vision_footnote
+        - seal
+        - formula_number
+        - footnote
+        - aside_text
+        - reference
+      table:
+        - table
+      formula:
+        - display_formula
+        - inline_formula
+      skip:                      # kept in output (image chunks), not OCR'd
+        - chart
+        - image
+      abandon:
+        - header
+        - footer
+        - number
+        - footer_image
+        - header_image

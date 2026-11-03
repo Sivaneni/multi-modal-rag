@@ -15,6 +15,10 @@ This script runs once at startup, sequentially:
 
 Subsequent requests find both models hot, eliminating the cold-start latency entirely.
 Only runs when PARSER_BACKEND=ollama (no-op for cloud mode).
+
+When the GLM-OCR SDK config uses api_mode=openai (GLM-OCR served by vLLM, see
+docker-compose.gpu.yml service `vllm-ocr`), the Ollama step is replaced by a
+health poll + one tiny OCR request against vLLM.
 """
 from __future__ import annotations
 
@@ -106,6 +110,38 @@ def warmup_ollama_glmocr(host: str, port: int, model: str) -> None:
         logger.warning(f"[warmup] GLM-OCR Ollama warmup skipped: {exc}")
 
 
+def warmup_vllm_glmocr(host: str, port: int, model: str) -> None:
+    """Wait for the vLLM GLM-OCR server, then send one tiny OCR request.
+
+    vLLM loads weights and captures CUDA graphs at startup, so the request just
+    confirms the endpoint + served model name work end to end.
+    """
+    warmup_vllm(f"http://{host}:{port}/v1", timeout_seconds=900)
+
+    url = f"http://{host}:{port}/v1/chat/completions"
+    logger.info(f"[warmup] GLM-OCR: test request to vLLM {url} (model={model}) ...")
+    t0 = time.monotonic()
+    payload = {
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image_url",
+                 "image_url": {"url": f"data:image/png;base64,{_tiny_white_png_b64()}"}},
+                {"type": "text", "text": "Text Recognition:"},
+            ],
+        }],
+        "max_tokens": 8,
+    }
+    try:
+        with httpx.Client(timeout=120.0) as client:
+            resp = client.post(url, json=payload)
+            resp.raise_for_status()
+        logger.info(f"[warmup] GLM-OCR (vLLM): ready in {time.monotonic() - t0:.1f}s")
+    except Exception as exc:
+        logger.warning(f"[warmup] GLM-OCR vLLM warmup failed: {exc}")
+
+
 def warmup_vllm(base_url: str, timeout_seconds: int = 300) -> None:
     """Poll vLLM /health until ready or timeout.
 
@@ -170,9 +206,11 @@ def main() -> None:
         ollama_host = ocr.api_host
         ollama_port = ocr.api_port
         ollama_model = ocr.model
+        ocr_api_mode = ocr.api_mode
     except Exception as exc:
         logger.warning(f"[warmup] Could not read Ollama config, using defaults: {exc}")
         ollama_host, ollama_port, ollama_model = "ollama", 11434, "glm-ocr:latest"
+        ocr_api_mode = "ollama_generate"
 
     logger.info("[warmup] Starting model pre-warm sequence...")
 
@@ -181,7 +219,10 @@ def main() -> None:
     warmup_pp_doclayout(settings.config_yaml_path)
 
     # GLM-OCR second — GPU is now free, model loads cleanly in one attempt.
-    warmup_ollama_glmocr(ollama_host, ollama_port, ollama_model)
+    if ocr_api_mode == "openai":
+        warmup_vllm_glmocr(ollama_host, ollama_port, ollama_model)
+    else:
+        warmup_ollama_glmocr(ollama_host, ollama_port, ollama_model)
 
     logger.info("[warmup] All models hot — handing off to API server")
 

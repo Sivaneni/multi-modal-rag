@@ -1,0 +1,6 @@
+# vLLM image for GLM-OCR + Qwen3-VL on the L40S.
+# GLM-OCR's README requires vLLM >= 0.19.0 and transformers >= 5.3.0.
+# Pinned (not :latest) so a new upstream image can't silently break the stack.
+FROM vllm/vllm-openai:v0.19.0-ubuntu2404
+
+RUN uv pip install --system "transformers>=5.3.0"
