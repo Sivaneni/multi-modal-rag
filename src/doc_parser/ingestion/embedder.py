@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 from abc import ABC, abstractmethod
 from collections import Counter
@@ -17,6 +18,32 @@ if TYPE_CHECKING:
     from doc_parser.config import Settings
 
 logger = logging.getLogger(__name__)
+
+# QwenVLEmbedder forward-pass batch sizes. Embedding a whole document in one
+# pass (e.g. 300 chunks x 512 tokens) needs several GB of activations and OOMs
+# when the GPU is shared with vLLM. Override via env if VRAM allows more.
+_TEXT_BATCH_SIZE = max(1, int(os.getenv("EMBED_BATCH_SIZE", "16")))
+_IMAGE_BATCH_SIZE = max(1, int(os.getenv("EMBED_IMAGE_BATCH_SIZE", "4")))
+
+
+def _last_token_pool(hidden_states, attention_mask):  # type: ignore[no-untyped-def]
+    """Return each sequence's hidden state at its last real (non-pad) token.
+
+    ``hidden_states[:, -1]`` is only correct with LEFT padding. With right
+    padding it returns a PAD-token state for every sequence shorter than the
+    longest one in the batch, silently degrading those embeddings. Using the
+    attention mask makes pooling correct for either padding side.
+    """
+    import torch
+
+    if attention_mask is None:
+        return hidden_states[:, -1]
+    left_padded = bool(attention_mask[:, -1].sum() == attention_mask.shape[0])
+    if left_padded:
+        return hidden_states[:, -1]
+    last_idx = attention_mask.sum(dim=1) - 1
+    batch_idx = torch.arange(hidden_states.size(0), device=hidden_states.device)
+    return hidden_states[batch_idx, last_idx]
 
 # Number of hash buckets for the sparse feature space.
 # 2^17 = 131072 — large enough to minimise collisions, small enough for Qdrant.
@@ -211,6 +238,9 @@ class QwenVLEmbedder(BaseEmbedder):
     def _embed_texts_sync(self, texts: list[str]) -> list[list[float]]:
         """Embed a list of texts synchronously using EOS-token pooling.
 
+        Runs in batches of ``EMBED_BATCH_SIZE`` (default 16) so large documents
+        don't exhaust GPU memory.
+
         Args:
             texts: Input texts to embed.
 
@@ -219,20 +249,25 @@ class QwenVLEmbedder(BaseEmbedder):
         """
         import torch
 
-        inputs = self._processor(
-            text=texts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=512,
-        )
-        inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
-        with torch.no_grad():
-            outputs = self._model(**inputs)
-        # EOS pooling: use the last token's hidden state as the sentence embedding
-        embeddings = outputs.last_hidden_state[:, -1, :]
-        embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=-1)
-        return embeddings.cpu().float().tolist()
+        results: list[list[float]] = []
+        for start in range(0, len(texts), _TEXT_BATCH_SIZE):
+            batch = texts[start : start + _TEXT_BATCH_SIZE]
+            inputs = self._processor(
+                text=batch,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=512,
+            )
+            inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
+            with torch.no_grad():
+                outputs = self._model(**inputs)
+            # EOS pooling: hidden state of each sequence's last real token
+            embeddings = _last_token_pool(outputs.last_hidden_state, inputs.get("attention_mask"))
+            embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=-1)
+            results.extend(embeddings.cpu().float().tolist())
+            del inputs, outputs, embeddings
+        return results
 
     def _embed_images_sync(self, images_b64: list[str]) -> list[list[float]]:
         """Embed a list of base64-encoded images synchronously using EOS-token pooling.
@@ -257,19 +292,24 @@ class QwenVLEmbedder(BaseEmbedder):
         # contain one <|image_pad|> placeholder, which the processor expands into
         # the correct number of patch tokens based on the image's resolution.
         # Without this, transformers passes text=[None] internally and crashes.
-        image_prompts = ["<|vision_start|><|image_pad|><|vision_end|>"] * len(images)
-        inputs = self._processor(
-            images=images,
-            text=image_prompts,
-            return_tensors="pt",
-            padding=True,
-        )
-        inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
-        with torch.no_grad():
-            outputs = self._model(**inputs)
-        embeddings = outputs.last_hidden_state[:, -1, :]
-        embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=-1)
-        return embeddings.cpu().float().tolist()
+        results: list[list[float]] = []
+        for start in range(0, len(images), _IMAGE_BATCH_SIZE):
+            batch = images[start : start + _IMAGE_BATCH_SIZE]
+            image_prompts = ["<|vision_start|><|image_pad|><|vision_end|>"] * len(batch)
+            inputs = self._processor(
+                images=batch,
+                text=image_prompts,
+                return_tensors="pt",
+                padding=True,
+            )
+            inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
+            with torch.no_grad():
+                outputs = self._model(**inputs)
+            embeddings = _last_token_pool(outputs.last_hidden_state, inputs.get("attention_mask"))
+            embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=-1)
+            results.extend(embeddings.cpu().float().tolist())
+            del inputs, outputs, embeddings
+        return results
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         """Embed texts by offloading the sync worker to a thread-pool executor.

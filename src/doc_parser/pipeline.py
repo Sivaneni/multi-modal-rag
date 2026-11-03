@@ -105,7 +105,9 @@ class ParseResult:
                 bbox_2d = raw_el.get("bbox_2d", [0, 0, 1, 1])
                 el = ParsedElement(
                     label=raw_el.get("label", "paragraph"),
-                    text=raw_el.get("content", ""),
+                    # SDK returns content=None for regions it doesn't OCR
+                    # (task "skip"); downstream code calls .strip() on text.
+                    text=raw_el.get("content") or "",
                     bbox=[float(v) for v in bbox_2d],
                     score=1.0,  # SDK does not provide a confidence score
                     reading_order=raw_el.get("index", len(elements)),

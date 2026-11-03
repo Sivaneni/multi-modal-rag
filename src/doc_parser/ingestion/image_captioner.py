@@ -174,13 +174,19 @@ def _looks_like_table(text: str) -> bool:
     Used as a pre-filter so we skip the table-extraction LLM call when the
     layout detector has mis-classified a caption paragraph (e.g. "Table 1:
     Runtime characteristics...", "Figure 3: Page 6 of the DocLayNet paper...")
-    as a ``table`` region. Real tables OCR'd by GLM-OCR come back as
-    pipe-delimited markdown; mis-classified caption text has zero pipes.
+    as a ``table`` region. Real tables OCR'd by GLM-OCR come back as either
+    HTML (``<table><tr><td>``, the GLM-OCR default for "Table Recognition:")
+    or pipe-delimited markdown; mis-classified caption text has neither.
     """
     if not text or not text.strip():
         return False
-    # GLM-OCR emits markdown-formatted tables with `|` separators. Real tables
-    # have many; prose has none.
+    # GLM-OCR's table prompt returns HTML tables. Require real cell structure,
+    # not just a stray tag in prose.
+    lowered = text.lower()
+    if "<table" in lowered and ("<td" in lowered or "<th" in lowered):
+        return True
+    # Markdown-formatted tables with `|` separators. Real tables have many;
+    # prose has none.
     if text.count("|") >= 3:
         return True
     # Tab-separated layouts are uncommon from GLM-OCR but possible from other
@@ -528,9 +534,11 @@ async def enrich_chunks(
             if not _looks_like_table(chunk.text):
                 logger.info(
                     "Skipping LLM extraction for chunk %s (no tabular markers: "
-                    "pipes=%d, len=%d) — keeping modality=table, image cropped=%s",
+                    "pipes=%d, html_table=%s, len=%d) — keeping modality=table, "
+                    "image cropped=%s",
                     chunk.chunk_id,
                     chunk.text.count("|"),
+                    "<table" in chunk.text.lower(),
                     len(chunk.text),
                     chunk.image_base64 is not None,
                 )
