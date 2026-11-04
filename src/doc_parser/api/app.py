@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from loguru import logger
+from prometheus_fastapi_instrumentator import Instrumentator
 
 from doc_parser.api.middleware import LoggingMiddleware
 from doc_parser.api.routes.generate import router as generate_router
@@ -44,6 +45,13 @@ def create_app() -> FastAPI:
     app.include_router(ingest_router, prefix="/ingest", tags=["ingest"])
     app.include_router(search_router, prefix="/search", tags=["search"])
     app.include_router(generate_router, prefix="/generate", tags=["generate"])
+
+    # Prometheus: per-route request rate/latency + ingest metrics (api/metrics.py)
+    # on GET /metrics. Buckets extended to minutes because ingest is slow.
+    Instrumentator(excluded_handlers=["/metrics", "/health"]).instrument(
+        app,
+        latency_lowr_buckets=(0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600),
+    ).expose(app, include_in_schema=False)
     return app
 
 

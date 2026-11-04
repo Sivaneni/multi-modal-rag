@@ -13,6 +13,7 @@ from loguru import logger
 from qdrant_client.models import SparseVector
 
 from doc_parser.api.dependencies import get_embedder_dep, get_openai_client, get_store
+from doc_parser.api.metrics import INGEST_CHUNKS, INGEST_PAGES, stage_timer, track_ingest
 from doc_parser.api.schemas import IngestRequest, IngestResponse
 from doc_parser.chunker import Chunk, document_aware_chunking
 from doc_parser.config import get_settings
@@ -97,47 +98,56 @@ async def _run_ingest(
 
     t0 = time.perf_counter()
 
-    # 1. Parse PDF (synchronous SDK call — offload to thread pool)
-    try:
-        parser = DocumentParser()
-        loop = asyncio.get_running_loop()
-        parse_result = await loop.run_in_executor(None, parser.parse_file, pdf_path)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except Exception as exc:
-        logger.exception("Parsing failed for {}: {}", source_name, exc)
-        raise HTTPException(status_code=500, detail=f"Parsing failed: {exc}") from exc
+    with track_ingest():  # Prometheus: in-progress, total time, success/failed
+        # 1. Parse PDF (synchronous SDK call — offload to thread pool)
+        try:
+            with stage_timer("parse"):
+                parser = DocumentParser()
+                loop = asyncio.get_running_loop()
+                parse_result = await loop.run_in_executor(None, parser.parse_file, pdf_path)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("Parsing failed for {}: {}", source_name, exc)
+            raise HTTPException(status_code=500, detail=f"Parsing failed: {exc}") from exc
 
-    # 2. Chunk — single pass over all pages so section headings and figure captions
-    #    are linked correctly even across page boundaries.
-    chunks = document_aware_chunking(
-        [(page.page_num, page.elements) for page in parse_result.pages],
-        source_file=source_name,
-        max_chunk_tokens=max_chunk_tokens,
-    )
-    logger.info("Chunked {} → {} chunks", source_name, len(chunks))
+        # 2. Chunk — single pass over all pages so section headings and figure captions
+        #    are linked correctly even across page boundaries.
+        with stage_timer("chunk"):
+            chunks = document_aware_chunking(
+                [(page.page_num, page.elements) for page in parse_result.pages],
+                source_file=source_name,
+                max_chunk_tokens=max_chunk_tokens,
+            )
+        logger.info("Chunked {} → {} chunks", source_name, len(chunks))
 
-    # 3. Caption image chunks (if enabled)
-    if caption and settings.image_caption_enabled:
-        chunks = await enrich_chunks(
-            chunks,
-            pdf_path=pdf_path,
-            client=client,
-            model=settings.openai_llm_model,
-        )
+        # 3. Caption image chunks (if enabled)
+        if caption and settings.image_caption_enabled:
+            with stage_timer("enrich"):
+                chunks = await enrich_chunks(
+                    chunks,
+                    pdf_path=pdf_path,
+                    client=client,
+                    model=settings.openai_llm_model,
+                )
 
-    # 4. Embed
-    dense, sparse = await embed_chunks(chunks, embedder, settings)
+        # 4. Embed
+        with stage_timer("embed"):
+            dense, sparse = await embed_chunks(chunks, embedder, settings)
 
-    # 4b. Persist chunks + embeddings to disk for inspection
-    _save_chunks_to_disk(chunks, dense, sparse, source_name)
+        # 4b. Persist chunks + embeddings to disk for inspection
+        _save_chunks_to_disk(chunks, dense, sparse, source_name)
 
-    # 5. Ensure collection exists then upsert
-    await store.create_collection(overwrite=overwrite)
-    upserted = await store.upsert_chunks(chunks, dense, sparse)
+        # 5. Ensure collection exists then upsert
+        with stage_timer("upsert"):
+            await store.create_collection(overwrite=overwrite)
+            upserted = await store.upsert_chunks(chunks, dense, sparse)
 
-    latency_ms = (time.perf_counter() - t0) * 1000
-    modality_counts = dict(Counter(c.modality for c in chunks))
+        latency_ms = (time.perf_counter() - t0) * 1000
+        modality_counts = dict(Counter(c.modality for c in chunks))
+        INGEST_PAGES.inc(len(parse_result.pages))
+        for modality, n in modality_counts.items():
+            INGEST_CHUNKS.labels(modality=modality).inc(n)
 
     return IngestResponse(
         source_file=source_name,
